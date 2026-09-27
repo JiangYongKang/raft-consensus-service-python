@@ -1,13 +1,18 @@
 """本地集群门面：在单进程内组装多个 RaftNode 实例与持久化目录。
 
-客户端调用通过模拟器事件队列派发到目标节点线程（串行执行），
-因此"并发多客户端"由模拟器事件循环天然串行化、不会乱序。
+执行模型
+--------
+模拟器事件循环跑在一条专用后台线程上；每个节点的定时器、RPC 与客户端任务都
+只在这条线程上执行 -> 节点内部无锁也不会乱序。客户端（可以有很多线程）通过
+每节点任务队列提交操作，任务在事件线程上串行执行，用 Event 同步结果。
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import shutil
+import threading
 from pathlib import Path
 
 from raft_consensus.errors import NotLeaderError
@@ -15,6 +20,16 @@ from raft_consensus.node import NodeConfig, RaftNode
 from raft_consensus.simulation import Simulator
 
 logger = logging.getLogger("raft.cluster")
+
+
+class _NodeTask:
+    __slots__ = ("fn", "event", "value", "error")
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.event = threading.Event()
+        self.value = None
+        self.error: Exception | None = None
 
 
 class LocalCluster:
@@ -42,6 +57,15 @@ class LocalCluster:
             node = self._make(nid)
             self.sim.add_node(node)
 
+        # 每节点任务队列（由后台事件泵线程轮询执行）
+        self._task_queues: dict[str, queue.Queue[_NodeTask | None]] = {
+            nid: queue.Queue() for nid in self.ids
+        }
+        self._pump_stop = threading.Event()
+        self._sim_lock = threading.Lock()  # 所有事件泵操作串行化
+        self._pump = threading.Thread(target=self._pump_loop, daemon=True,
+                                      name="raft-pump")
+
     def _make_builder(self, nid: str):
         def build() -> RaftNode:
             node = self._make(nid)
@@ -57,14 +81,49 @@ class LocalCluster:
             schedule=self.sim.make_scheduler(nid),
             now=self.sim.make_clock(),
             new_msg_id=self.sim.new_msg_id,
+            is_peer_reachable=lambda peer, src=nid:
+                self.sim.network.reachable(src, peer),
         )
+
+    # ---- 后台事件泵 ----
+    def _step(self) -> bool:
+        with self._sim_lock:
+            return self.sim.step()
+
+    def _pump_loop(self) -> None:
+        while not self._pump_stop.is_set():
+            advanced = self._step()
+            for nid, q in self._task_queues.items():
+                if self.sim.network.is_offline(nid):
+                    continue
+                drained = 0
+                while drained < 64:
+                    try:
+                        task = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    drained += 1
+                    if task is None:
+                        continue
+                    try:
+                        with self._sim_lock:
+                            task.value = task.fn(self.sim.nodes[nid])
+                    except Exception as e:  # noqa: BLE001 - 跨线程带回
+                        task.error = e
+                    finally:
+                        task.event.set()
+            if not advanced:
+                self._pump_stop.wait(0.002)  # 空闲让出 CPU
 
     # ---- 生命周期 ----
     def start(self) -> None:
         for nid in self.ids:
             self.sim.nodes[nid].start()
+        self._pump.start()
 
     def stop(self) -> None:
+        self._pump_stop.set()
+        self._pump.join(timeout=2)
         for node in list(self.sim.nodes.values()):
             node.shutdown()
 
@@ -74,25 +133,57 @@ class LocalCluster:
 
     # ---- 故障注入 ----
     def crash(self, node_id: str) -> None:
-        self.sim.crash(node_id)
+        # 排空该节点在途任务，以 NodeOfflineError 失败，避免客户端永久挂起
+        q = self._task_queues[node_id]
+        pending: list[_NodeTask] = []
+        while True:
+            try:
+                t = q.get_nowait()
+            except queue.Empty:
+                break
+            if t is not None:
+                pending.append(t)
+        with self._sim_lock:
+            self.sim.crash(node_id)
+        from raft_consensus.errors import NodeOfflineError
+        for t in pending:
+            t.error = NodeOfflineError(node=node_id)
+            t.event.set()
 
     def restart(self, node_id: str) -> None:
-        self.sim.restart(node_id)
+        with self._sim_lock:
+            self.sim.restart(node_id)
 
     def partition(self, groups: list[set[str]] | None) -> None:
-        self.sim.network.partition(groups)
+        with self._sim_lock:
+            self.sim.network.partition(groups)
 
     def run_until(self, predicate, timeout: float = 5.0) -> bool:
-        return self.sim.run_until(predicate, timeout=timeout)
+        deadline = self.sim.now() + timeout
+        while True:
+            with self._sim_lock:
+                if predicate():
+                    return True
+                if self.sim.now() > deadline:
+                    return False
+                advanced = self.sim.step()
+            if not advanced:
+                self._pump_stop.wait(0.002)
 
     def run_for(self, seconds: float) -> None:
-        self.sim.run_for(seconds)
+        deadline = self.sim.now() + seconds
+        while True:
+            with self._sim_lock:
+                if self.sim.now() >= deadline:
+                    return
+                if not self.sim.step():
+                    break
+            self._pump_stop.wait(0.001)
 
     # ---- 观测 ----
     def leader(self) -> str | None:
         leaders = [n.node_id for n in self.sim.nodes.values()
                    if n.role == "leader"]
-        # 同一任期最多一个领导者；若瞬时出现两个，交由测试断言发现
         return leaders[0] if leaders else None
 
     def leaders(self) -> list[str]:
@@ -119,59 +210,50 @@ class LocalCluster:
             }
         return out
 
-    # ---- 客户端操作（提交后驱动事件泵，避免阻塞死锁）----
-    def _submit_and_wait(self, target: str, submit, is_done,
-                         timeout: float = 3.0):
-        """在目标节点线程上提交一个异步操作，再在主线程驱动事件泵直到完成。"""
-        box: dict = {}
+    # ---- 客户端操作 ----
+    def _submit(self, node_id: str, fn, timeout: float = 5.0):
+        task = _NodeTask(fn)
+        self._task_queues[node_id].put(task)
+        if not task.event.wait(timeout):
+            raise TimeoutError(f"operation on {node_id} timed out")
+        if task.error:
+            raise task.error
+        return task.value
 
-        def job():
-            try:
-                box["handle"] = submit(self.sim.nodes[target])
-            except Exception as e:  # noqa: BLE001 - 跨线程带回
-                box["error"] = e
-
-        self.sim.schedule(0.0, job)
+    def _wait_handle(self, handle, is_done, timeout: float):
         deadline = self.sim.now() + timeout
-
-        def finished():
-            return "error" in box or ("handle" in box and is_done(box["handle"]))
-
-        ok = self.sim.run_until(finished, timeout=timeout)
-        if "error" in box:
-            raise box["error"]
-        if not ok or "handle" not in box:
-            raise TimeoutError(f"operation on {target} not finished in {timeout}s")
-        return box["handle"]
+        while not is_done(handle):
+            if self.sim.now() > deadline:
+                raise TimeoutError("consensus result not ready in time")
+            with self._sim_lock:
+                advanced = self.sim.step()
+            if not advanced:
+                self._pump_stop.wait(0.002)
 
     def write(self, client_id: str, request_id: str, key: str, value: object,
-              *, node_id: str | None = None, timeout: float = 3.0) -> dict:
+              *, node_id: str | None = None, timeout: float = 5.0) -> dict:
         target = node_id or self.leader()
         if target is None:
             raise NotLeaderError(term=0, leader_id=None)
-        prop = self._submit_and_wait(
+        prop = self._submit(
             target,
             lambda n: n.submit_write(client_id, request_id,
                                      {"op": "set", "key": key, "value": value}),
-            lambda p: p.event.is_set(),
             timeout=timeout,
         )
+        self._wait_handle(prop, lambda p: p.event.is_set(), timeout)
         if prop.error:
             raise prop.error
         return {"index": prop.index, "result": prop.result, "leader": target,
                 "term": prop.term}
 
     def read(self, key: str, *, node_id: str | None = None,
-             timeout: float = 3.0) -> object:
+             timeout: float = 5.0) -> object:
         target = node_id or self.leader()
         if target is None:
             raise NotLeaderError(term=0, leader_id=None)
-        pr = self._submit_and_wait(
-            target,
-            lambda n: n.submit_read(key),
-            lambda r: r.event.is_set(),
-            timeout=timeout,
-        )
+        pr = self._submit(target, lambda n: n.submit_read(key), timeout=timeout)
+        self._wait_handle(pr, lambda r: r.event.is_set(), timeout)
         if pr.error:
             raise pr.error
         return pr.result

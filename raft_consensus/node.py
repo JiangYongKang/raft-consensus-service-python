@@ -98,7 +98,8 @@ class RaftNode:
                  now: Callable[[], float],
                  new_msg_id: Callable[[], str],
                  applied_callback: Callable[[str, int, int, dict, object], None]
-                    | None = None) -> None:
+                    | None = None,
+                 is_peer_reachable: Callable[[str], bool] | None = None) -> None:
         self.config = config
         self.node_id = config.node_id
         self.peers = tuple(config.peers)
@@ -108,6 +109,7 @@ class RaftNode:
         self._now = now
         self._new_msg_id = new_msg_id
         self.applied_callback = applied_callback
+        self._is_peer_reachable = is_peer_reachable
         self.logr = logging.getLogger(f"raft.node.{self.node_id}")
         self.rng = random.Random(config.seed)
 
@@ -210,8 +212,8 @@ class RaftNode:
             self.store.save_state(term, None)
         self.role = FOLLOWER
         self.leader_id = leader
-        if leader is not None:
-            self._resolve_inflight_demotion()
+        self._resolve_inflight_demotion()
+        self._fail_pending_reads()
         self._reset_election_timer()
 
     def _resolve_inflight_demotion(self) -> None:
@@ -234,6 +236,10 @@ class RaftNode:
 
     # ================= 选举 =================
     def on_election_timeout(self) -> None:
+        # 从领导者退位：必须以可区分原因终结全部在途客户端提案与读
+        if self.role == LEADER:
+            self._resolve_inflight_demotion()
+            self._fail_pending_reads()
         self.role = CANDIDATE
         self.current_term += 1
         term = self.current_term
@@ -407,6 +413,9 @@ class RaftNode:
                 break  # 再旧的更不可能是当前任期
             count = 1  # 领导者自己
             for p in self.other_peers:
+                # 分区/离线节点的旧 match_index 绝不能计入"当前多数确认"
+                if self._is_peer_reachable and not self._is_peer_reachable(p):
+                    continue
                 if self.match_index.get(p, 0) >= idx:
                     count += 1
             if count >= majority:
