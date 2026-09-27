@@ -46,6 +46,7 @@ class AppendEntriesResult:
     match_index: int           # 成功时跟随者已复制到的位点
     hint_index: int            # 失败时建议领导者回退到的位点
     reason: str
+    request_id: str = ""       # 对应 AppendEntries.request_id（读确认关联）
 
 
 # 统一的网络信封
