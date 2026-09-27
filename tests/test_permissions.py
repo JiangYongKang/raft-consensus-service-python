@@ -80,7 +80,8 @@ def test_write_to_follower_rejected_not_leader(cluster3):
     follower = next(n for n in cluster3.ids
                     if cluster3.node(n).role != "leader")
     with pytest.raises(NotLeaderError) as ei:
-        cluster3.write("c", "x", "k", 1, node_id=follower, timeout=2)
+        cluster3.write("c", "x", "k", 1, node_id=follower,
+                          timeout=2, retries=1)
     # 错误里要能给出当前主提示，便于客户端重试，而不是静默失败
     assert ei.value.leader_id is not None
 

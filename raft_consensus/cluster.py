@@ -231,32 +231,56 @@ class LocalCluster:
                 self._pump_stop.wait(0.002)
 
     def write(self, client_id: str, request_id: str, key: str, value: object,
-              *, node_id: str | None = None, timeout: float = 5.0) -> dict:
-        target = node_id or self.leader()
-        if target is None:
-            raise NotLeaderError(term=0, leader_id=None)
-        prop = self._submit(
-            target,
-            lambda n: n.submit_write(client_id, request_id,
-                                     {"op": "set", "key": key, "value": value}),
-            timeout=timeout,
-        )
-        self._wait_handle(prop, lambda p: p.event.is_set(), timeout)
-        if prop.error:
-            raise prop.error
-        return {"index": prop.index, "result": prop.result, "leader": target,
-                "term": prop.term}
+              *, node_id: str | None = None, timeout: float = 5.0,
+              retries: int = 20) -> dict:
+        """客户端写。默认允许在主切换/无主瞬间退避重试（同一 request_id 幂等）。"""
+        last: Exception | None = None
+        for _ in range(retries):
+            target = node_id or self.leader()
+            if target is None:
+                self.run_until(lambda: self.leader() is not None, timeout)
+                last = NotLeaderError(term=0, leader_id=None)
+                continue
+            try:
+                prop = self._submit(
+                    target,
+                    lambda n: n.submit_write(
+                        client_id, request_id,
+                        {"op": "set", "key": key, "value": value}),
+                    timeout=timeout,
+                )
+                self._wait_handle(prop, lambda p: p.event.is_set(), timeout)
+                if prop.error:
+                    raise prop.error
+                return {"index": prop.index, "result": prop.result,
+                        "leader": target, "term": prop.term}
+            except NotLeaderError as e:
+                last = e
+                # 主切换：等待新主后用同一 request_id 重试（幂等，不产生重复）
+                self.run_until(lambda: self.leader() is not None, timeout)
+        assert last is not None
+        raise last
 
     def read(self, key: str, *, node_id: str | None = None,
-             timeout: float = 5.0) -> object:
-        target = node_id or self.leader()
-        if target is None:
-            raise NotLeaderError(term=0, leader_id=None)
-        pr = self._submit(target, lambda n: n.submit_read(key), timeout=timeout)
-        self._wait_handle(pr, lambda r: r.event.is_set(), timeout)
-        if pr.error:
-            raise pr.error
-        return pr.result
+             timeout: float = 5.0, retries: int = 20) -> object:
+        last: Exception | None = None
+        for _ in range(retries):
+            target = node_id or self.leader()
+            if target is None:
+                self.run_until(lambda: self.leader() is not None, timeout)
+                continue
+            try:
+                pr = self._submit(target, lambda n: n.submit_read(key),
+                                  timeout=timeout)
+                self._wait_handle(pr, lambda r: r.event.is_set(), timeout)
+                if pr.error:
+                    raise pr.error
+                return pr.result
+            except NotLeaderError as e:
+                last = e
+                self.run_until(lambda: self.leader() is not None, timeout)
+        assert last is not None
+        raise last
 
     def wait_leader(self, timeout: float = 3.0) -> str:
         assert self.run_until(lambda: self.leader() is not None, timeout), \

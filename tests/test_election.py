@@ -37,7 +37,8 @@ def test_isolated_node_cannot_commit(cluster3):
     # （选举超时后旧主应退位为 follower，写入被 NotLeaderError 拒绝）
     cluster3.run_until(lambda: cluster3.node(leader).role != "leader", timeout=3)
     with pytest.raises(NotLeaderError) as ei:
-        cluster3.write("c", "r-old", "k", "v", node_id=leader, timeout=0.4)
+        cluster3.write("c", "r-old", "k", "v", node_id=leader,
+                         timeout=0.4, retries=1)
     assert ei.value.term is not None
 
     # 恢复分区，集群最终收敛到同一任期/状态
