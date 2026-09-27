@@ -47,6 +47,10 @@ class AppendEntriesResult:
     hint_index: int            # 失败时建议领导者回退到的位点
     reason: str
     request_id: str = ""       # 对应 AppendEntries.request_id（读确认关联）
+    # 论文 §5.3 冲突任期快速回退（XTerm/XIndex/XLen）
+    conflict_term: int = 0     # 失败时 prev_index 处跟随者日志的实际任期
+    conflict_first_index: int = 0  # 该冲突任期在跟随者日志中的第一条位点
+    follower_last_index: int = 0   # 跟随者当前最后位点
 
 
 # 统一的网络信封

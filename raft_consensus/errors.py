@@ -50,10 +50,16 @@ class AlreadyVotedError(ConsensusError):
 
 
 class LogCheckMismatchError(ConsensusError):
-    """AppendEntries 的前序位点/任期一致性检查不匹配，拒绝并回退位点。"""
+    """AppendEntries 的前序位点/任期一致性检查不匹配，拒绝并回退位点。
+
+    携带论文 §5.3 快速回退协商信息：
+      conflict_term / conflict_first_index / follower_last_index。
+    """
 
     def __init__(self, *, expected_index: int, expected_term: int,
-                 hint_index: int, node: str | None = None):
+                 hint_index: int, node: str | None = None,
+                 conflict_term: int = 0, conflict_first_index: int = 0,
+                 follower_last_index: int = 0):
         super().__init__(
             f"log mismatch at index {expected_index} term {expected_term}; "
             f"hint next index {hint_index}",
@@ -62,6 +68,9 @@ class LogCheckMismatchError(ConsensusError):
         self.expected_index = expected_index
         self.expected_term = expected_term
         self.hint_index = hint_index
+        self.conflict_term = conflict_term
+        self.conflict_first_index = conflict_first_index
+        self.follower_last_index = follower_last_index
 
 
 class CommittedRollbackError(ConsensusError):

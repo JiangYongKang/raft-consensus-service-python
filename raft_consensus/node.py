@@ -375,13 +375,19 @@ class RaftNode:
 
     def _handle_append_result(self, peer: str,
                               result: AppendEntriesResult) -> None:
+        # 响应有效性：必须仍为当前任期的领导者。旧任期/已退位的响应一律忽略
+        # （回退分支严格单调下降，同任期重复响应幂等安全）。
         if self.role != LEADER:
             return
         if result.term > self.current_term:
             self._become_follower(result.term, None)
             self._fail_pending_reads()
             return
-        if self.current_term != result.term:
+        if result.term < self.current_term:
+            # 过期响应（旧主/旧任期回包）：不能据此回退，否则会把正常位点拉乱
+            self.logr.info("[replication] ignore stale response peer=%s "
+                           "resp_term=%d current=%d reason=%s",
+                           peer, result.term, self.current_term, result.reason)
             return
         if result.success:
             new_match = result.match_index
@@ -396,12 +402,42 @@ class RaftNode:
             if self.next_index[peer] <= self.log.last_index:
                 self._replicate_to(peer)
         else:
-            hint = result.hint_index
-            self.next_index[peer] = max(1, min(self.next_index[peer] - 1,
-                                               hint + 1))
-            self.logr.info("[replication] backoff peer=%s next->%d reason=%s",
-                           peer, self.next_index[peer], result.reason)
+            # 论文 §5.3 冲突任期快速回退（每轮 next_index 严格下降）：
+            #  1) 跟随者缺日志（XLen）：直接退到 follower_last_index+1
+            #  2) 领导者日志里有该冲突任期：退到该任期在领导者处的最后位点
+            #  3) 领导者没有该任期（XTerm）：退到冲突任期首条位点之前
+            old_next = self.next_index[peer]
+            ct = result.conflict_term
+            flen = result.follower_last_index
+            if flen and flen < old_next - 1:
+                target = flen + 1
+            elif ct and self._log_has_term(ct):
+                target = self._last_index_of_term(ct) + 1
+            else:
+                target = result.hint_index + 1
+            target = max(1, min(target, old_next - 1))
+            self.next_index[peer] = target
+            self.logr.info("[replication] backoff peer=%s next %d -> %d "
+                           "(conflict_term=%d follower_last=%d) reason=%s",
+                           peer, old_next, target, ct, flen, result.reason)
             self._replicate_to(peer)
+
+    def _log_has_term(self, term: int) -> bool:
+        for e in self.log.entries:
+            if e.term == term:
+                return True
+            if e.term > term:
+                break
+        return False
+
+    def _last_index_of_term(self, term: int) -> int:
+        last = 0
+        for e in self.log.entries:
+            if e.term == term:
+                last = e.index
+            elif e.term > term:
+                break
+        return last
 
     def _advance_commit(self) -> None:
         """论文 §5.4.2：只在当前任期下推进 commit_index，且需多数 match。"""
@@ -473,24 +509,27 @@ class RaftNode:
             self.leader_id = msg.leader_id
         self._reset_election_timer()
 
-        # prev 一致性检查（不匹配会抛 LogCheckMismatchError）
+        # prev 一致性检查（不匹配会抛 LogCheckMismatchError，含快速回退信息）
         if msg.prev_log_index > self.log.last_index:
+            # XLen 情形：跟随者缺日志，回到它最后位点之后
             raise LogCheckMismatchError(
                 expected_index=msg.prev_log_index,
                 expected_term=msg.prev_log_term,
-                hint_index=self.log.last_index, node=self.node_id)
+                hint_index=self.log.last_index, node=self.node_id,
+                follower_last_index=self.log.last_index)
         if msg.prev_log_index >= 1 and \
                 self.log.term_at(msg.prev_log_index) != msg.prev_log_term:
+            # XTerm/XIndex 情形：找到跟随者在冲突位点所属任期的第一条记录
             actual = self.log.term_at(msg.prev_log_index)
-            hint = msg.prev_log_index - 1
-            i = msg.prev_log_index
-            while i > 0 and self.log.entries[i].term == actual:
-                hint = i - 1
-                i -= 1
+            first = msg.prev_log_index
+            while first > 1 and self.log.term_at(first - 1) == actual:
+                first -= 1
             raise LogCheckMismatchError(
                 expected_index=msg.prev_log_index,
                 expected_term=msg.prev_log_term,
-                hint_index=hint, node=self.node_id)
+                hint_index=first - 1, node=self.node_id,
+                conflict_term=actual, conflict_first_index=first,
+                follower_last_index=self.log.last_index)
 
         # 合并 entries（内部会拒绝覆盖已提交区间）
         try:
@@ -571,8 +610,11 @@ class RaftNode:
                                         payload=err, msg_id=env.msg_id))
                 return
         except ConsensusError as err:
-            self.logr.warning("[rpc] reject caller=%s id=%s: %s",
-                              env.src, env.msg_id, err.reason)
+            # 任何拒绝都必须带上接收方当前任期，供对端判断新旧并说明原因
+            if err.term is None:
+                err.term = self.current_term
+            self.logr.warning("[rpc] reject caller=%s id=%s term=%d: %s",
+                              env.src, env.msg_id, err.term, err.reason)
             self._send_raw(Envelope(src=self.node_id, dst=env.src,
                                     payload=err, msg_id=env.msg_id))
             return
@@ -700,6 +742,9 @@ def _error_to_result(err: ConsensusError, kind: str = "vote") -> object:
                        getattr(err, "commit_index", 0))
         return AppendEntriesResult(
             term=term, success=False, follower_id=node,
-            match_index=0, hint_index=hint, reason=err.reason)
+            match_index=0, hint_index=hint, reason=err.reason,
+            conflict_term=getattr(err, "conflict_term", 0),
+            conflict_first_index=getattr(err, "conflict_first_index", 0),
+            follower_last_index=getattr(err, "follower_last_index", 0))
     return RequestVoteResult(
         term=term, vote_granted=False, voter_id=node, reason=err.reason)

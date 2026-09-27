@@ -93,21 +93,21 @@ class RaftLog:
 
         # --- 边界 1：prev 一致性检查 ---
         if prev_index > self.last_index:
-            hint = self.last_index
             raise LogCheckMismatchError(
-                expected_index=prev_index, expected_term=prev_term, hint_index=hint,
-            )
+                expected_index=prev_index, expected_term=prev_term,
+                hint_index=self.last_index,
+                follower_last_index=self.last_index)
         actual_term = self.term_at(prev_index)
         if actual_term != prev_term:
-            # 快速回退提示：找到该冲突任期第一条记录之前的位点
-            hint = prev_index - 1
-            i = prev_index
-            while i > 0 and self.entries[i].term == actual_term:
-                hint = i - 1
-                i -= 1
+            # XTerm/XIndex：冲突任期在本地日志中的第一条位点
+            first = prev_index
+            while first > 1 and self.entries[first - 1].term == actual_term:
+                first -= 1
             raise LogCheckMismatchError(
-                expected_index=prev_index, expected_term=prev_term, hint_index=hint,
-            )
+                expected_index=prev_index, expected_term=prev_term,
+                hint_index=first - 1,
+                conflict_term=actual_term, conflict_first_index=first,
+                follower_last_index=self.last_index)
 
         # --- 合并 new_entries ---
         for offset, incoming in enumerate(new_entries):
