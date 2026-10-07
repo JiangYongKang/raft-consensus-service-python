@@ -31,11 +31,14 @@ from .types import (
     AppendEntriesRequest,
     AppendEntriesResponse,
     ClientResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
     LogEntry,
     NodeStatus,
     RequestVoteRequest,
     RequestVoteResponse,
     Role,
+    Snapshot,
 )
 
 log = logging.getLogger("raft")
@@ -59,6 +62,7 @@ class RaftNode:
         admin_token: str = "local-cluster-token",
         rng: random.Random | None = None,
         state_machine_factory=None,
+        snapshot_threshold: int = 100,
     ) -> None:
         self.node_id = node_id
         self.peers = list(peers)
@@ -74,6 +78,8 @@ class RaftNode:
         self._apply_timeout = apply_timeout
         self._admin_token = admin_token
         self._rng = rng or random.Random()
+        # 已应用历史超出快照边界这么多条后触发压缩（<=0 表示关闭自动压缩）
+        self._snapshot_threshold = snapshot_threshold
 
         self._lock = threading.RLock()
         self._apply_lock = threading.Lock()
@@ -90,7 +96,7 @@ class RaftNode:
         self._sending: set[str] = set()
         self._pending: dict[int, threading.Event] = {}
         self._results: dict[int, dict] = {}
-        self._dedup: dict[tuple[str, str], tuple[int, dict, int]] = {}
+        self._dedup: dict[tuple[str, str], tuple[int, dict, int, int]] = {}
         self._client_max_seq: dict[str, int] = {}
 
         # 计时器/线程
@@ -101,15 +107,48 @@ class RaftNode:
         self._stop_event: threading.Event = threading.Event()
         self._thread: threading.Thread | None = None
 
+        self._restore_from_snapshot()
         self._rebuild_indexes()
         self._replay_committed()
+
+    # ------------------------------------------------------------------ #
+    # 快照恢复（启动 / 重启 / 安装主节点快照共用）
+    # ------------------------------------------------------------------ #
+    def _restore_from_snapshot(self) -> None:
+        """若存储里已有快照：直接以快照恢复状态机与幂等水位，不再从最早日志重放。"""
+        snap = self.storage.snapshot()
+        if snap is None:
+            return
+        self.sm.restore(snap.data, snap.last_included_index)
+        self._merge_snapshot_dedup(snap)
+        self.commit_index = max(self.commit_index, snap.last_included_index)
+        self.last_applied = self.sm.last_applied
+        log.info(
+            "node=%s RESTORE-SNAPSHOT boundary=(%d,%d) keys=%d dedup=%d commit_index=%d",
+            self.node_id, snap.last_included_index, snap.last_included_term,
+            len(snap.data), len(snap.dedup), self.commit_index,
+        )
+
+    def _merge_snapshot_dedup(self, snap: Snapshot) -> None:
+        """把快照携带的幂等去重/序列号水位并入内存，保证压缩后旧请求重试仍幂等。"""
+        for key, rec in snap.dedup.items():
+            idx, seq, cmd = rec[0], rec[1], rec[2]
+            result = rec[3] if len(rec) > 3 else None
+            entry_term = rec[4] if len(rec) > 4 else snap.last_included_term
+            client_id, request_id = key.split("\x01", 1)
+            self._dedup.setdefault((client_id, request_id), (idx, cmd, seq, entry_term))
+            if result is not None:
+                self._results.setdefault(idx, result)
+        for client_id, max_seq in snap.client_max_seq.items():
+            if max_seq > self._client_max_seq.get(client_id, 0):
+                self._client_max_seq[client_id] = max_seq
 
     # ------------------------------------------------------------------ #
     # 索引重建与恢复
     # ------------------------------------------------------------------ #
     def _rebuild_indexes(self) -> None:
         for e in self.storage.all_entries():
-            self._dedup[(e.client_id, e.request_id)] = (e.index, e.command, e.client_seq)
+            self._dedup[(e.client_id, e.request_id)] = (e.index, e.command, e.client_seq, e.term)
             prev = self._client_max_seq.get(e.client_id, 0)
             if e.client_seq > prev:
                 self._client_max_seq[e.client_id] = e.client_seq
@@ -194,12 +233,14 @@ class RaftNode:
             self._pending = {}
             self.last_applied = 0
             self.commit_index = self.storage.commit_index()
+        self._restore_from_snapshot()
         self._rebuild_indexes()
         self._replay_committed()
         log.info(
-            "node=%s RESTART recovered term=%d commit_index=%d last_log_index=%d applied=%d",
+            "node=%s RESTART recovered term=%d commit_index=%d last_log_index=%d applied=%d "
+            "snapshot_index=%d",
             self.node_id, self.storage.current_term, self.commit_index,
-            self.storage.last_index(), self.last_applied,
+            self.storage.last_index(), self.last_applied, self.storage.snapshot_index(),
         )
         self.start()
 
@@ -429,6 +470,85 @@ class RaftNode:
             return RequestVoteResponse(term=term, vote_granted=granted, reason=reason)
 
     # ------------------------------------------------------------------ #
+    # InstallSnapshot RPC（落后节点按快照追赶）
+    # ------------------------------------------------------------------ #
+    def handle_install_snapshot(self, req: InstallSnapshotRequest) -> InstallSnapshotResponse:
+        entry_epoch = self._epoch
+        if req.leader_id not in self.members:
+            raise UnauthorizedError(
+                f"install-snapshot from unknown node {req.leader_id!r}",
+                term=self.storage.current_term,
+            )
+        with self._lock:
+            if not self._running or self._epoch != entry_epoch:
+                return InstallSnapshotResponse(
+                    term=self.storage.current_term, success=False, reason="node_restarting"
+                )
+            term = self.storage.current_term
+            if req.term < term:
+                log.info(
+                    "node=%s snapshot-denied source=%s reason=stale-term local=%d remote=%d "
+                    "snapshot_id=%s",
+                    self.node_id, req.leader_id, term, req.term, req.snapshot_id,
+                )
+                return InstallSnapshotResponse(term=term, success=False, reason="stale_term")
+            if req.term > term:
+                self._become_follower_locked(req.term)
+                term = req.term
+            if self._role == Role.CANDIDATE:
+                self._role = Role.FOLLOWER
+            self._leader_id = req.leader_id
+            self._reset_election_timer_locked()
+
+            current_snap = self.storage.snapshot_index()
+            if req.last_included_index <= current_snap:
+                # 本地快照已覆盖该边界：幂等确认，不重复安装
+                log.info(
+                    "node=%s SNAPSHOT-SKIP source=%s snapshot_id=%s boundary=(%d,%d) "
+                    "reason=already-covered local_snapshot=%d",
+                    self.node_id, req.leader_id, req.snapshot_id,
+                    req.last_included_index, req.last_included_term, current_snap,
+                )
+                return InstallSnapshotResponse(
+                    term=term, success=True, last_included_index=current_snap,
+                    reason="already_covered",
+                )
+
+            snap = Snapshot(
+                last_included_index=req.last_included_index,
+                last_included_term=req.last_included_term,
+                data=req.data,
+                dedup=req.dedup,
+                client_max_seq=req.client_max_seq,
+            )
+            self.storage.install_snapshot(snap)
+            # 快照只承载多数派已提交历史：位点只能前进，绝不回退
+            self._merge_snapshot_dedup(snap)
+            self.commit_index = max(self.commit_index, snap.last_included_index)
+        # 状态机恢复与 apply 串行（_apply_lock），且不持有 _lock，
+        # 与 _maybe_compact 的锁顺序（_apply_lock -> _lock）保持一致，避免死锁
+        with self._apply_lock:
+            if snap.last_included_index > self.sm.last_applied:
+                self.sm.restore(snap.data, snap.last_included_index)
+        with self._lock:
+            self.last_applied = self.sm.last_applied
+            # 快照覆盖的等待中的客户端请求直接放行（结果以快照内水位为准）
+            for idx in [i for i in self._pending if i <= snap.last_included_index]:
+                ev = self._pending.pop(idx, None)
+                if ev is not None:
+                    ev.set()
+            log.info(
+                "node=%s SNAPSHOT-INSTALL source=%s snapshot_id=%s boundary=(%d,%d) "
+                "commit_index=%d last_applied=%d keys=%d",
+                self.node_id, req.leader_id, req.snapshot_id,
+                snap.last_included_index, snap.last_included_term,
+                self.commit_index, self.last_applied, len(snap.data),
+            )
+            return InstallSnapshotResponse(
+                term=term, success=True, last_included_index=snap.last_included_index,
+            )
+
+    # ------------------------------------------------------------------ #
     # AppendEntries RPC
     # ------------------------------------------------------------------ #
     def handle_append_entries(self, req: AppendEntriesRequest) -> AppendEntriesResponse:
@@ -475,32 +595,58 @@ class RaftNode:
             self._leader_id = req.leader_id
             self._reset_election_timer_locked()
 
-            # 2) 日志一致性检查
+            # 2) 日志一致性检查（快照感知）
+            snap_idx = self.storage.snapshot_index()
+            entries = req.entries
+            prev_index, prev_term = req.prev_log_index, req.prev_log_term
+            if prev_index < snap_idx:
+                # 前段已被本地快照覆盖：丢弃落在快照区间内的条目，
+                # 以快照边界作为一致性锚点（边界即已提交事实，无需比对任期）
+                entries = [e for e in entries if e.index > snap_idx]
+                prev_index, prev_term = snap_idx, self.storage.snapshot_term()
+                log.info(
+                    "node=%s append-anchor-snapshot source=%s snapshot_boundary=%d "
+                    "kept_entries=%d",
+                    self.node_id, req.leader_id, snap_idx, len(entries),
+                )
             last = self.storage.last_index()
-            if req.prev_log_index > last:
+            if prev_index > last:
                 log.info(
                     "node=%s append-denied source=%s reason=missing-prev local_last=%d prev=(%d,%d)",
-                    self.node_id, req.leader_id, last, req.prev_log_index, req.prev_log_term,
+                    self.node_id, req.leader_id, last, prev_index, prev_term,
                 )
                 return AppendEntriesResponse(
                     term=term, success=False, match_index=last, reason="missing_prev_entries"
                 )
-            if req.prev_log_index > 0 and self.storage.term_at(req.prev_log_index) != req.prev_log_term:
-                conflict = self.storage.term_at(req.prev_log_index)
+            if prev_index > 0 and self.storage.term_at(prev_index) != prev_term:
+                if prev_index <= snap_idx:
+                    # 与已提交快照边界冲突：绝不截断快照区，明确拒绝，
+                    # 主节点回退后会改用 InstallSnapshot 对齐
+                    log.error(
+                        "node=%s append-denied source=%s reason=snapshot-boundary-conflict "
+                        "boundary=(%d,%d) leader_term=%d",
+                        self.node_id, req.leader_id, snap_idx,
+                        self.storage.snapshot_term(), prev_term,
+                    )
+                    return AppendEntriesResponse(
+                        term=term, success=False, match_index=snap_idx,
+                        reason="snapshot_boundary_conflict",
+                    )
+                conflict = self.storage.term_at(prev_index)
                 log.info(
                     "node=%s append-denied source=%s reason=log-inconsistent at=%d "
                     "local_term=%d leader_term=%d -> truncate",
-                    self.node_id, req.leader_id, req.prev_log_index, conflict, req.prev_log_term,
+                    self.node_id, req.leader_id, prev_index, conflict, prev_term,
                 )
-                self.storage.truncate_from(req.prev_log_index)
+                self.storage.truncate_from(prev_index)
                 return AppendEntriesResponse(
                     term=term, success=False,
-                    match_index=max(0, req.prev_log_index - 1), reason="log_inconsistent",
+                    match_index=max(0, prev_index - 1), reason="log_inconsistent",
                 )
 
             # 3) 追加新条目（同 index 不同任期则截断冲突后缀）
             appended: list[LogEntry] = []
-            for e in req.entries:
+            for e in entries:
                 existing = self.storage.get_entry(e.index)
                 if existing is None:
                     self.storage.append_entries([e])
@@ -529,7 +675,7 @@ class RaftNode:
                         self.node_id, old, new_commit, req.leader_id, term,
                     )
 
-            match = req.prev_log_index + len(req.entries)
+            match = prev_index + len(entries)
             resp = AppendEntriesResponse(
                 term=term, success=True, match_index=match, reason="ok"
             )
@@ -574,18 +720,27 @@ class RaftNode:
                         return
                     leader_term = self.storage.current_term
                     ni = self.next_index[target]
-                    prev = ni - 1
-                    prev_term = self.storage.term_at(prev) if prev >= 0 else 0
-                    entries = self.storage.entries_from(ni)
-                    req = AppendEntriesRequest(
-                        term=leader_term,
-                        leader_id=self.node_id,
-                        prev_log_index=prev,
-                        prev_log_term=prev_term,
-                        entries=entries,
-                        leader_commit=self.commit_index,
-                    )
-                    batch_ids = [e.request_id for e in entries]
+                    snap_req: InstallSnapshotRequest | None = None
+                    if ni <= self.storage.snapshot_index():
+                        # 对端需要的旧历史已被本地压缩：改走快照追赶
+                        snap_req = self._build_snapshot_request_locked(leader_term)
+                    if snap_req is None:
+                        prev = ni - 1
+                        prev_term = self.storage.term_at(prev) if prev >= 0 else 0
+                        entries = self.storage.entries_from(ni)
+                        req = AppendEntriesRequest(
+                            term=leader_term,
+                            leader_id=self.node_id,
+                            prev_log_index=prev,
+                            prev_log_term=prev_term,
+                            entries=entries,
+                            leader_commit=self.commit_index,
+                        )
+                        batch_ids = [e.request_id for e in entries]
+                if snap_req is not None:
+                    if not self._send_snapshot_to(target, snap_req, leader_term, epoch):
+                        return
+                    continue
                 try:
                     resp = self.transport.append_entries(target, req, timeout=1.0)
                 except Exception as e:
@@ -628,6 +783,68 @@ class RaftNode:
             with self._lock:
                 self._sending.discard(target)
 
+    def _build_snapshot_request_locked(self, term: int) -> InstallSnapshotRequest | None:
+        snap = self.storage.snapshot()
+        if snap is None:
+            return None
+        return InstallSnapshotRequest(
+            term=term,
+            leader_id=self.node_id,
+            last_included_index=snap.last_included_index,
+            last_included_term=snap.last_included_term,
+            snapshot_id=f"snap-{self.node_id}-{uuid.uuid4().hex[:8]}",
+            data=snap.data,
+            dedup=snap.dedup,
+            client_max_seq=snap.client_max_seq,
+        )
+
+    def _send_snapshot_to(
+        self, target: str, req: InstallSnapshotRequest, leader_term: int, epoch: int
+    ) -> bool:
+        """向落后过久的 follower 发送快照；返回 True 表示应继续普通复制循环。"""
+        log.info(
+            "node=%s SNAPSHOT-SEND target=%s snapshot_id=%s boundary=(%d,%d) "
+            "reason=follower-behind-compacted",
+            self.node_id, target, req.snapshot_id,
+            req.last_included_index, req.last_included_term,
+        )
+        try:
+            resp = self.transport.install_snapshot(target, req, timeout=5.0)
+        except Exception as e:
+            log.debug("node=%s install-snapshot to=%s failed: %s", self.node_id, target, e)
+            return False
+        with self._lock:
+            if (self._role != Role.LEADER or self._epoch != epoch
+                    or self.storage.current_term != leader_term):
+                return False
+            if resp.term > leader_term:
+                self._become_follower_locked(resp.term)
+                log.info(
+                    "node=%s step-down source=%s reason=stale-term-on-snapshot %d->%d",
+                    self.node_id, target, leader_term, resp.term,
+                )
+                return False
+            if not resp.success:
+                log.info(
+                    "node=%s SNAPSHOT-REJECTED target=%s snapshot_id=%s reason=%s",
+                    self.node_id, target, req.snapshot_id, resp.reason,
+                )
+                return False
+            if req.last_included_index > self.match_index.get(target, 0):
+                self.match_index[target] = req.last_included_index
+            self.next_index[target] = max(
+                self.next_index[target], req.last_included_index + 1
+            )
+            log.info(
+                "node=%s SNAPSHOT-ACK target=%s snapshot_id=%s match_index=%d next_index=%d",
+                self.node_id, target, req.snapshot_id,
+                self.match_index[target], self.next_index[target],
+            )
+            advanced = self._advance_commit_index_locked()
+        if advanced and self._epoch == epoch:
+            self._apply_committed()
+        return True
+
     def _advance_commit_index_locked(self) -> bool:
         """多数派推进提交位点；只直接提交当前任期条目（Raft 安全约束）。"""
         if self._role != Role.LEADER:
@@ -653,7 +870,7 @@ class RaftNode:
         while True:
             with self._lock:
                 if self.last_applied >= self.commit_index:
-                    return
+                    break
                 idx = self.last_applied + 1
                 entry = self.storage.get_entry(idx)
             if entry is None:
@@ -676,7 +893,49 @@ class RaftNode:
                     if ev is not None:
                         ev.set()
                 if self.last_applied < idx:
-                    return  # 已被其他线程处理，避免 busy loop
+                    break  # 已被其他线程处理，避免 busy loop
+        self._maybe_compact()
+
+    # ------------------------------------------------------------------ #
+    # 日志压缩（本地快照）
+    # ------------------------------------------------------------------ #
+    def _maybe_compact(self) -> None:
+        """已应用历史超出快照边界达到阈值时，把它们压缩成一份状态快照。
+
+        只压缩“已提交且已应用”的条目；压缩期间新的写入照常追加/提交，
+        互斥点仅在读取状态机与存储的短临界区内，不阻塞复制线程。
+        """
+        if self._snapshot_threshold <= 0:
+            return
+        with self._apply_lock:  # 与 apply 串行，保证快照内容恰好对应边界位点
+            with self._lock:
+                snap_idx = self.storage.snapshot_index()
+                # 状态机位点是应用进度的唯一事实来源，边界必须与之严格一致
+                boundary = self.sm.last_applied
+                if boundary - snap_idx < self._snapshot_threshold:
+                    return
+                boundary_entry = self.storage.get_entry(boundary)
+                if boundary_entry is None:
+                    return  # 边界条目已不在日志里（理论不可能：applied 之上才压缩）
+                dedup = {
+                    f"{cid}\x01{rid}": [idx, seq, cmd, self._results.get(idx), e_term]
+                    for (cid, rid), (idx, cmd, seq, e_term) in self._dedup.items()
+                    if idx <= boundary
+                }
+                snap = Snapshot(
+                    last_included_index=boundary,
+                    last_included_term=boundary_entry.term,
+                    data=self.sm.snapshot(),
+                    dedup=dedup,
+                    client_max_seq=dict(self._client_max_seq),
+                )
+                dropped = self.storage.save_snapshot(snap)
+            log.info(
+                "node=%s COMPACT snapshot_boundary=(%d,%d) dropped_entries=%d "
+                "commit_index=%d last_applied=%d",
+                self.node_id, snap.last_included_index, snap.last_included_term,
+                dropped, self.commit_index, self.last_applied,
+            )
 
 
     # ------------------------------------------------------------------ #
@@ -707,7 +966,7 @@ class RaftNode:
             # 幂等：相同 (client_id, request_id) 必须返回首次结果，绝不重复执行
             prior = self._dedup.get(key)
             if prior is not None:
-                idx, prior_cmd, prior_seq = prior
+                idx, prior_cmd, prior_seq, entry_term = prior
                 if prior_cmd != command:
                     raise DuplicateRequestError(
                         f"request_id={request_id!r} reused by client {client_id!r} "
@@ -719,11 +978,13 @@ class RaftNode:
                     self.node_id, idx, client_id, request_id,
                 )
                 if idx <= self.commit_index:
+                    # 条目可能已被压缩：任期取自去重记录（随快照归档），不查日志
                     return ClientResponse(
-                        success=True, index=idx, term=self.storage.term_at(idx),
+                        success=True, index=idx, term=entry_term,
                         result=self._results.get(idx), leader_id=self.node_id,
                     )
                 ev = self._pending.setdefault(idx, threading.Event())
+                resp_term = entry_term
             else:
                 # 顺序边界：同一客户端的序列号必须严格递增，过期/乱序请求拒绝
                 max_seq = self._client_max_seq.get(client_id, 0)
@@ -739,10 +1000,11 @@ class RaftNode:
                     client_id=client_id, request_id=request_id, client_seq=client_seq,
                 )
                 self.storage.append_entries([entry])
-                self._dedup[key] = (idx, command, client_seq)
+                self._dedup[key] = (idx, command, client_seq, term)
                 self._client_max_seq[client_id] = client_seq
                 ev = threading.Event()
                 self._pending[idx] = ev
+                resp_term = term
                 log.info(
                     "node=%s PROPOSE index=%d term=%d source=%s request_id=%s seq=%d",
                     self.node_id, idx, term, client_id, request_id, client_seq,
@@ -763,7 +1025,7 @@ class RaftNode:
         with self._lock:
             return ClientResponse(
                 success=True, index=idx,
-                term=self.storage.term_at(idx), result=self._results.get(idx),
+                term=resp_term, result=self._results.get(idx),
                 leader_id=self.node_id,
             )
 
@@ -800,6 +1062,8 @@ class RaftNode:
                 last_applied=self.last_applied,
                 last_log_index=self.storage.last_index(),
                 last_log_term=self.storage.last_term(),
+                snapshot_index=self.storage.snapshot_index(),
+                snapshot_term=self.storage.snapshot_term(),
             )
 
     def is_leader(self) -> bool:

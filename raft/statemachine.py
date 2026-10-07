@@ -59,3 +59,18 @@ class StateMachine:
     def snapshot(self) -> dict:
         with self._lock:
             return dict(self._data)
+
+    def restore(self, data: dict, last_applied: int) -> None:
+        """用快照整体替换状态机状态，并把应用位点直接设为快照边界。
+
+        只允许向前移动位点：快照覆盖的都是已提交历史，恢复快照绝不回退
+        已经应用的位点（避免已生效结果往回退）。
+        """
+        with self._lock:
+            if last_applied < self._last_applied:
+                raise InvalidCommitError(
+                    f"snapshot restore cannot move apply position backwards: "
+                    f"{last_applied} < {self._last_applied}"
+                )
+            self._data = dict(data)
+            self._last_applied = last_applied

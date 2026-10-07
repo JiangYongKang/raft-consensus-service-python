@@ -13,11 +13,14 @@ from .types import (
     AppendEntriesRequest,
     AppendEntriesResponse,
     ClientResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
     LogEntry,
     NodeStatus,
     RequestVoteRequest,
     RequestVoteResponse,
     Role,
+    Snapshot,
 )
 
 __all__ = [
@@ -35,5 +38,8 @@ __all__ = [
     "RequestVoteResponse",
     "AppendEntriesRequest",
     "AppendEntriesResponse",
+    "InstallSnapshotRequest",
+    "InstallSnapshotResponse",
+    "Snapshot",
     "ClientResponse",
 ]

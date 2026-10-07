@@ -41,7 +41,7 @@ from .errors import (
 from .node import RaftNode
 from .statemachine import StateMachine
 from .storage import FileStorage
-from .transport import HttpTransport, append_entries_from_dict
+from .transport import HttpTransport, append_entries_from_dict, install_snapshot_from_dict
 from .types import RequestVoteRequest
 
 log = logging.getLogger("raft")
@@ -86,6 +86,7 @@ class NodeHolder:
             state_machine_factory=StateMachine,
             election_timeout=(int(lo_s) / 1000.0, int(hi_s) / 1000.0),
             heartbeat_interval=hb_ms / 1000.0,
+            snapshot_threshold=int(os.environ.get("RAFT_SNAPSHOT_THRESHOLD", "100")),
         )
         if start:
             node.start()
@@ -209,6 +210,8 @@ def create_app(
             "last_applied": s.last_applied,
             "last_log_index": s.last_log_index,
             "last_log_term": s.last_log_term,
+            "snapshot_index": s.snapshot_index,
+            "snapshot_term": s.snapshot_term,
             "crashed": False,
         }
 
@@ -244,6 +247,25 @@ def create_app(
             "term": resp.term,
             "success": resp.success,
             "match_index": resp.match_index,
+            "reason": resp.reason,
+        }
+
+    @application.post("/raft/install-snapshot")
+    async def raft_install_snapshot(body: dict):
+        node = require_node()
+        if node is None:
+            return _error_response("node_down", "node crashed", 503)
+        try:
+            req = install_snapshot_from_dict(body)
+            resp = node.handle_install_snapshot(req)
+        except UnauthorizedError as e:
+            return _error_response(e.code, e.reason, 403, term=e.term)
+        except (KeyError, TypeError) as e:
+            return _error_response("bad_request", str(e), 400)
+        return {
+            "term": resp.term,
+            "success": resp.success,
+            "last_included_index": resp.last_included_index,
             "reason": resp.reason,
         }
 
