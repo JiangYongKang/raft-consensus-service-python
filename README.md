@@ -10,16 +10,19 @@
 ```
 raft/
   errors.py        可区分的一致性错误（错误码 + 原因 + 任期）
-  types.py         LogEntry / RPC 请求响应 / 节点状态等数据结构
-  storage.py       持久化：InMemoryStorage 与 FileStorage（原子落盘 + fsync）
-  statemachine.py  确定性 KV 状态机（set/delete/noop），位点必须连续
+  types.py         LogEntry / RPC 请求响应（含 InstallSnapshot）/ 节点状态等数据结构
+  storage.py       持久化：InMemoryStorage 与 FileStorage（原子落盘 + fsync），
+                   日志压缩（base index/term）与快照存取
+  statemachine.py  确定性 KV 状态机（set/delete/noop），位点必须连续，可安装快照
   transport.py     LoopbackTransport（进程内，可注入分区/宕机）与 HttpTransport
-  node.py          RaftNode：选举、任期、复制、提交、应用、幂等、鉴权、崩溃恢复
+  node.py          RaftNode：选举、任期、复制、提交、应用、幂等、鉴权、崩溃恢复、
+                   日志压缩与快照追赶
   cluster.py       InProcessCluster：测试用集群编排与故障注入
   server.py        单节点 FastAPI 服务（客户端 API / Raft RPC / 管理 API）
 scripts/
   run_local_cluster.py   一键拉起 3 个 uvicorn 进程
-tests/               选举、复制、崩溃重启、分区恢复、幂等、并发、权限、多进程 E2E
+tests/               选举、复制、崩溃重启、分区恢复、幂等、并发、权限、
+                     日志压缩与快照追赶、多进程 E2E
 ```
 
 ## 一致性语义与规则
@@ -79,7 +82,62 @@ tests/               选举、复制、崩溃重启、分区恢复、幂等、�
 - 分区恢复后，少数派侧未提交的日志会被多数派的已提交日志截断覆盖，
   各节点日志与状态机最终完全一致。
 
-### 5. 并发与权限边界
+### 5. 日志压缩与快照追赶
+
+**什么时候触发压缩**：节点每应用完一批已提交日志就检查一次，
+`last_applied - snapshot_index >= snapshot_threshold` 时把截至 `last_applied`
+的历史压缩成一份快照。阈值可配置：
+
+- 进程内/单测：`RaftNode(..., snapshot_threshold=N)`（默认 100，<=0 关闭）；
+- 多进程 HTTP：环境变量 `RAFT_SNAPSHOT_THRESHOLD`（默认 100）。
+
+压缩只覆盖**已提交且已应用**的边界，因此已生效结果不会丢、不重、不回退；
+压缩在应用循环之外瞬时完成，新写入照常提交，节点不会被卡住。
+
+**快照里装了什么**（FileStorage 落 `{node_id}.snapshot.json`，原子写入）：
+
+- `last_included_index` / `last_included_term`：快照覆盖的日志边界（含该条）；
+- `snapshot_id`：本次快照的唯一标识，用于全链路日志追踪；
+- 状态机全量数据（KV）；
+- 幂等元数据：`(client_id, request_id) -> (index, command, client_seq, term)`、
+  各客户端 `client_seq` 上限、已应用结果——保证压缩与重启之后重复请求
+  仍命中首次结果，已提交结论不可被回退或覆盖。
+
+压缩后，边界及之前的日志条目从存储中删除（FileStorage 主状态文件只保留
+边界之后的条目），磁盘占用不再随历史无限增长；日志逻辑起点变为
+`(snapshot_index, snapshot_term)`，位点比较、追加连续性检查都以它为基准。
+
+**落后节点怎么判断走快照还是普通复制**：由主节点按每个 follower 的
+`nextIndex` 决定——
+
+- `nextIndex > snapshot_index`：需要的条目还在日志里，走普通 AppendEntries；
+- `nextIndex <= snapshot_index`：需要的旧历史已被压缩，改发
+  `InstallSnapshot`（整份快照 + 边界 + snapshot_id）。
+
+follower 收到快照时：旧任期拒绝；不比本地快照新的幂等跳过
+（`already_covered`）；否则先推进持久化的 commitIndex、落快照、压缩日志，
+再安装状态机状态（位点只前进不后退）。若快照边界条目与本地日志任期冲突，
+边界之后的本地日志整段作废——那些条目必然未被提交。装完快照后，
+边界之后的新历史仍走普通 AppendEntries 补齐。follower 收到与本地快照
+边界重叠的 AppendEntries 时，会先裁掉被覆盖的前缀再做一致性检查，
+不会接错中间某一段。
+
+**本地重启恢复**：节点重启时先加载本地快照直接恢复状态机与幂等元数据
+（日志打印 `SNAPSHOT-RESTORE`），只重放快照边界之后的已提交日志，
+不再从最早那条历史开始。
+
+**可解释性**：压缩边界（`SNAPSHOT-COMPACT boundary=(i,t) threshold=N`）、
+追赶来源与请求标识（`SNAPSHOT-SEND to=X snapshot_id=...` /
+`SNAPSHOT-INSTALL source=Y snapshot_id=...`）、本地恢复
+（`SNAPSHOT-RESTORE`）都能在日志里直接看出某个节点为什么停在这个进度上；
+`/status` 也暴露 `snapshot_index` / `snapshot_term`。
+
+**与已提交边界的兼容范围**：快照只覆盖已提交位点及其之前的历史；
+commitIndex、last_applied 在压缩与快照追赶全程只前进不回退；
+存储层依然对任何回退抛 `invalid_commit_position`；
+被截断的未提交条目的幂等记录会同步清除，已提交条目的幂等记录随快照永久保留。
+
+### 6. 并发与权限边界
 
 - 所有易变/持久状态由节点内锁保护，**持锁期间不做网络 IO**；每个 follower
   最多一个在途 AppendEntries 工作线程，避免请求乱序互相覆盖。
@@ -125,6 +183,9 @@ curl -s localhost:8101/status
 管理（需令牌）：`/admin/step-down`、`/admin/partition`、`/admin/heal`、
 `/admin/crash`、`/admin/restart`，请求头加 `-H 'X-RAFT-AUTH: local-cluster-token'`。
 
+节点间 Raft RPC 新增 `POST /raft/install-snapshot`（主节点向落后过多的
+follower 发送整份快照）；`/status` 响应含 `snapshot_index` / `snapshot_term`。
+
 ## 本地验证方法
 
 一键启动 3 进程集群并跑一轮演示（选举 → 写入复制 → 主读/follower 拒绝）：
@@ -138,10 +199,19 @@ uv run python scripts/run_local_cluster.py
 
 节点数据在 `./.raft-data/`，删除即可重置；`--keep-data` 可保留上次数据验证重启恢复。
 
+复现日志压缩与快照追赶（多进程）：把阈值调小，写够数量后观察
+`.raft-data/` 下出现 `*.snapshot.json`、主状态文件中的 `log` 被截短，
+节点日志出现 `SNAPSHOT-COMPACT`；再清空某个节点的数据文件并重启，
+观察 `SNAPSHOT-SEND` / `SNAPSHOT-INSTALL` 完成快照追赶：
+
+```bash
+RAFT_SNAPSHOT_THRESHOLD=5 uv run python scripts/run_local_cluster.py --client
+```
+
 运行测试（全部为本地、无需外部服务）：
 
 ```bash
-uv run pytest                       # 全部 24 个用例（含真实多进程 HTTP E2E）
+uv run pytest                       # 全部 33 个用例（含真实多进程 HTTP E2E）
 ```
 
 测试会通过 `raft` logger 打印**任期变化、提交/应用位点、来源节点与请求标识**，
@@ -150,6 +220,7 @@ uv run pytest                       # 全部 24 个用例（含真实多进程 H
 ```bash
 RAFT_TEST_LOG=INFO uv run pytest -k crash        # 崩溃重启
 RAFT_TEST_LOG=INFO uv run pytest -k partition    # 分区恢复
+RAFT_TEST_LOG=INFO uv run pytest -k snapshot     # 日志压缩与快照追赶
 RAFT_TEST_LOG=INFO uv run pytest tests/test_http_cluster.py   # 真实多进程
 ```
 
@@ -159,6 +230,11 @@ RAFT_TEST_LOG=INFO uv run pytest tests/test_http_cluster.py   # 真实多进程
 - 复制：多数派提交、无多数派失败码、幂等重试、request_id 复用冲突、
   序列号回退、位点不可回退；
 - 恢复：follower 崩溃重启（FileStorage）、空盘追赶、分区恢复后日志一致；
+- 日志压缩：阈值触发、旧条目落盘移除、压缩期间写入不丢不重、
+  压缩后幂等重试仍命中首次结果；
+- 快照追赶：离线过久/空盘节点只能靠快照追上并断言最终一致、
+  轻微落后仍走普通复制、已提交结论不被快照回退、本地快照重启恢复、
+  幂等元数据随快照跨重启保留；
 - 并发：8 客户端×10 写不丢不重不乱序、同 request_id 并发只产生一条、
   主节点崩溃切换期间持续写入；
 - 权限：令牌/身份/任期三种拒绝原因可区分；

@@ -64,6 +64,31 @@ class AppendEntriesResponse:
 
 
 @dataclass
+class InstallSnapshotRequest:
+    """主节点向落后过多的 follower 发送的整份快照。
+
+    snapshot_id 用于日志追踪（哪次追赶用了哪份快照）；
+    last_included_index/term 是快照覆盖的日志边界（含该条）；
+    data 为状态机快照载荷（含幂等去重元数据）。
+    """
+
+    term: int
+    leader_id: str
+    snapshot_id: str
+    last_included_index: int
+    last_included_term: int
+    data: dict = field(default_factory=dict)
+
+
+@dataclass
+class InstallSnapshotResponse:
+    term: int
+    success: bool
+    match_index: int = 0
+    reason: str = ""
+
+
+@dataclass
 class ClientCommand:
     client_id: str
     request_id: str
@@ -93,3 +118,5 @@ class NodeStatus:
     last_applied: int
     last_log_index: int
     last_log_term: int
+    snapshot_index: int = 0
+    snapshot_term: int = 0

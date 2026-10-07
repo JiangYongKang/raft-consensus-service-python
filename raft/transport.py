@@ -21,6 +21,8 @@ from typing import Protocol
 from .types import (
     AppendEntriesRequest,
     AppendEntriesResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
     LogEntry,
     RequestVoteRequest,
     RequestVoteResponse,
@@ -33,6 +35,8 @@ class RaftHandler(Protocol):
     def handle_request_vote(self, req: RequestVoteRequest) -> RequestVoteResponse: ...
 
     def handle_append_entries(self, req: AppendEntriesRequest) -> AppendEntriesResponse: ...
+
+    def handle_install_snapshot(self, req: InstallSnapshotRequest) -> InstallSnapshotResponse: ...
 
 
 def append_entries_to_dict(req: AppendEntriesRequest) -> dict:
@@ -62,6 +66,12 @@ class Transport(ABC):
     def append_entries(
         self, target: str, req: AppendEntriesRequest, *, timeout: float = 1.0
     ) -> AppendEntriesResponse:
+        raise NotImplementedError
+
+    @abstractmethod
+    def install_snapshot(
+        self, target: str, req: InstallSnapshotRequest, *, timeout: float = 2.0
+    ) -> InstallSnapshotResponse:
         raise NotImplementedError
 
     def start(self) -> None:
@@ -159,6 +169,17 @@ class LoopbackTransport(Transport):
         self._delay()
         return handler.handle_append_entries(req)
 
+    def install_snapshot(
+        self, target: str, req: InstallSnapshotRequest, *, timeout: float = 2.0
+    ) -> InstallSnapshotResponse:
+        with self._lock:
+            self._reachable(req.leader_id, target)
+            handler = self._handlers.get(target)
+        if handler is None:
+            raise ConnectionError(f"unknown node {target}")
+        self._delay()
+        return handler.handle_install_snapshot(req)
+
 
 class HttpTransport(Transport):
     """HTTP JSON 传输（无第三方依赖，urllib）。
@@ -226,3 +247,9 @@ class HttpTransport(Transport):
     ) -> AppendEntriesResponse:
         d = self._post(target, "/raft/append-entries", append_entries_to_dict(req), timeout)
         return AppendEntriesResponse(**d)
+
+    def install_snapshot(
+        self, target: str, req: InstallSnapshotRequest, *, timeout: float = 2.0
+    ) -> InstallSnapshotResponse:
+        d = self._post(target, "/raft/install-snapshot", asdict(req), timeout)
+        return InstallSnapshotResponse(**d)

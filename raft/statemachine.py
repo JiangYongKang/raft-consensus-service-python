@@ -59,3 +59,19 @@ class StateMachine:
     def snapshot(self) -> dict:
         with self._lock:
             return dict(self._data)
+
+    def install(self, data: dict, last_applied: int) -> None:
+        """用快照整体替换当前状态（快照追赶/本地恢复）。
+
+        位点只允许前进：快照比当前已应用位点旧时直接拒绝，
+        保证已生效结果不会回退。
+        """
+        with self._lock:
+            if last_applied < self._last_applied:
+                raise InvalidCommitError(
+                    f"snapshot install would move state backwards: "
+                    f"{last_applied} < applied {self._last_applied}",
+                    term=None,
+                )
+            self._data = dict(data)
+            self._last_applied = last_applied
